@@ -1,6 +1,6 @@
 #include "main.h"
 #include "lemlib/api.hpp" // IWYU pragma: keep
-#include <cmath>
+#include "pid_tuner.hpp"
 
 // things to change/check before starting: 
 
@@ -19,18 +19,17 @@ pros::Controller controller(pros::E_CONTROLLER_MASTER);
 // negated (e.g. {-1, -2, -3}) or your bot will drive in a circle instead
 // of straight. Confirm with a bench test (drive both sides forward,
 // watch which wheels actually spin forward) before trusting odometry/PID.
-pros::MotorGroup leftMotors({1, 2, 3}, pros::MotorGearset::red); // left motor group - ports 1, 2, 3
-pros::MotorGroup rightMotors({4, 5, 6}, pros::MotorGearset::red); // right motor group - ports 4, 5, 6
+pros::MotorGroup leftMotors({-18, -19, -20}, pros::MotorGearset::red); // left motor group - ports 1, 2, 3
+pros::MotorGroup rightMotors({15, 16, 17}, pros::MotorGearset::red); // right motor group - ports 4, 5, 6
 
-pros::MotorGroup lift_right({13}); 
-pros::MotorGroup lift_left({12});
+pros::Motor lift_right(1); 
+pros::Motor lift_left(-2);
 
-pros::Motor intake(11);
+pros::Motor rotation(11);
 
-pros::adi::Pneumatics claw('A', false); 
-pros::adi::Pneumatics claw_rotate('B', false); 
+pros::adi::Pneumatics clamp('H', true); 
 // Inertial Sensor on port 10
-pros::Imu imu(10);
+pros::Imu imu(21);
 
 // tracking wheels
 // horizontal tracking wheel encoder. Rotation sensor, port 20, not reversed
@@ -40,25 +39,25 @@ pros::Rotation horizontalEnc(20);
 // V5 smart port -- verify on the bench which one is actually plugged into
 // port 11 and move the other to a free port (e.g. 14, 15, or 16).
 // vertical tracking wheel encoder. Rotation sensor, port 11, reversed
-pros::Rotation verticalEnc(-11);
+pros::Rotation verticalEnc(9);
 // horizontal tracking wheel. 2.75" diameter, 5.75" offset, back of the robot (negative)
 lemlib::TrackingWheel horizontal(&horizontalEnc, lemlib::Omniwheel::NEW_2, -5.75);
 // vertical tracking wheel. 2.75" diameter, 2.5" offset, left of the robot (negative)
-lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_2, -2.5);
+lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_2, 0.3);
 
 // drivetrain settings
 lemlib::Drivetrain drivetrain(&leftMotors, // left motor group
                               &rightMotors, // right motor group
-                              10, // 10 inch track width
+                              11.25, // 11.25 inch track width
                               lemlib::Omniwheel::NEW_325, // using new 4" omnis
                               360, // drivetrain rpm is 360
                               8 // horizontal drift is 2. If we had traction wheels, it would have been 8
 );
 
 // lateral motion controller
-lemlib::ControllerSettings linearController(10, // proportional gain (kP)
-                                            0, // integral gain (kI)
-                                            0, // derivative gain (kD)
+lemlib::ControllerSettings linearController(7.7, // proportional gain (kP)
+                                            0.001, // integral gain (kI)
+                                            3.7, // derivative gain (kD)
                                             0, // anti windup
                                             0, // small error range, in inches
                                             0, // small error range timeout, in milliseconds
@@ -70,19 +69,19 @@ lemlib::ControllerSettings linearController(10, // proportional gain (kP)
 // angular motion controller
 lemlib::ControllerSettings angularController(2, // proportional gain (kP)
                                              0, // integral gain (kI)
-                                             0, // derivative gain (kD)
+                                             9, // derivative gain (kD)
                                              0, // anti windup
                                              0, // small error range, in degrees
                                              0, // small error range timeout, in milliseconds
                                              0, // large error range, in degrees
                                              0, // large error range timeout, in milliseconds
-                                             0 // maximum acceleration (slew)
+                                             20 // maximum acceleration (slew) -- ramps output up instead of snapping to full speed instantly; raise/lower to tune how "abrupt" turns feel
 );
 
 // sensors for odometry
 lemlib::OdomSensors sensors(&vertical, // vertical tracking wheel
                             nullptr, // vertical tracking wheel 2, set to nullptr as we don't have a second one
-                            &horizontal, // horizontal tracking wheel
+                            nullptr, // horizontal tracking wheel
                             nullptr, // horizontal tracking wheel 2, set to nullptr as we don't have a second one
                             &imu // inertial sensor
 );
@@ -102,46 +101,35 @@ lemlib::ExpoDriveCurve steerCurve(3, // joystick deadband out of 127
 // create the chassis
 lemlib::Chassis chassis(drivetrain, linearController, angularController, sensors, &throttleCurve, &steerCurve);
 
-// ============================================================================
-//  Blue-alliance coordinate flip
-// ============================================================================
-// Override's field is 180-degree POINT symmetric between alliances -- the
-// red and blue starting tiles are diagonally opposite through the exact
-// center of the field, not mirrored across a single axis. So every red-side
-// coordinate maps to blue with a full point reflection through the origin:
-// (x, y) -> (-x, -y), and heading rotates a full 180 degrees.
-//
-// VERIFY THIS against your actual field before trusting it: look at the
-// field from above. If red-right's starting tile, rotated 180 degrees about
-// the center, lands you on blue's tile, this (x,y)->(-x,-y) reflection is
-// correct. If instead the alliance tiles are mirrored across just one wall
-// (a plain left/right or up/down flip, not a rotation), you'd want
-// (x, -y) or (-x, y) instead -- that's a different field layout and this
-// function would need to change.
-float flipX(float x, bool isBlue) { return isBlue ? -x : x; }
-float flipY(float y, bool isBlue) { return isBlue ? -y : y; }
-float flipHeading(float thetaDeg, bool isBlue) {
-    if (!isBlue) return thetaDeg;
-    float h = std::fmod(thetaDeg + 180.0f, 360.0f);
-    if (h < 0) h += 360.0f;
-    return h;
-}
-
-
 void initialize() {
     pros::lcd::initialize(); // initialize brain screen
     chassis.calibrate(); // calibrate sensors
+    // set a known origin (0,0,0) so pose readings while driving in opcontrol
+    // (see screenTask below) are relative to wherever you physically place
+    // the robot at power-on -- that's the point you'll walk it back to when
+    // you transcribe coordinates into the auto routines.
 
-    // thread to for brain screen and position logging
+    // thread to for brain screen, controller screen, and position logging
     pros::Task screenTask([&]() {
         while (true) {
+            lemlib::Pose pose = chassis.getPose();
             // print robot location to the brain screen
-            pros::lcd::print(0, "X: %f", chassis.getPose().x); // x
-            pros::lcd::print(1, "Y: %f", chassis.getPose().y); // y
-            pros::lcd::print(2, "Theta: %f", chassis.getPose().theta); // heading
+            pros::lcd::print(0, "X: %f", pose.x); // x
+            pros::lcd::print(1, "Y: %f", pose.y); // y
+            pros::lcd::print(2, "Theta: %f", pose.theta); // heading
+            // TEMP DIAGNOSTIC: raw IMU heading vs LemLib's computed theta above --
+            // if these two disagree, the problem is in odom/LemLib config, not the
+            // sensor. If they agree (and are both wrong), it's the IMU/wiring itself.
+            pros::lcd::print(3, "IMU raw: %f", imu.get_heading());
+            // also mirror pose onto the controller screen so it's readable
+            // while you're standing next to the robot driving it around to
+            // record coordinates for the auto routines. print() is rate
+            // limited by VEXos, hence only updating every 50ms below.
+            controller.print(0, 0, "X:%.1f Y:%.1f", pose.x, pose.y);
+            controller.print(1, 0, "H:%.1f", pose.theta);
             // log position telemetry
             lemlib::telemetrySink()->info("Chassis pose: {}", chassis.getPose());
-            // delay to save resources
+            // delay to save resources, also satisfies controller print rate limit
             pros::delay(50);
         }
     });
@@ -170,116 +158,151 @@ ASSET(example_txt); // '.' replaced with "_" to make c++ happy
 
 // forward declarations -- needed because autonomous() (below) calls these
 // before their bodies appear later in the file
-void right_side_auto(bool isBlue = false);
-void left_side_auto(bool isBlue = false);
+void right_side_auto();
+void left_side_auto();
 void skills();
 
-// TODO(strategy): pick which of these 4 actually runs, e.g. with an LCD
-// selector read in initialize(). right_side_auto(true) is red-right's
-// route flipped 180 degrees -- confirm on the real field which blue
-// quadrant that geometrically lands you in (see flipX/flipY comment above)
-// before assuming "right" means the same physical side for both alliances.
 void autonomous() {
+
     right_side_auto();       // red right
     // left_side_auto();     // red left
-    // right_side_auto(true); // blue (flipped from red right)
-    // left_side_auto(true);  // blue (flipped from red left)
 }
 
 
-// or probably just take cordinates by driving robot to those places and recording cordinates and coding it. 
-void right_side_auto(bool isBlue) {
-    // TODO(wiring): confirm this heading matches how the robot is
-    // physically placed on the tile (0 = facing +Y, LemLib's compass
-    // convention, increasing clockwise).
-    chassis.setPose(flipX(-11.443, isBlue), flipY(-64.429, isBlue), flipHeading(0, isBlue));
+// or probably just take cordinates by driving robot to those places and recording cordinates and coding it.
+void right_side_auto() {
+    // heading 38.75 = 38.75 degrees CLOCKWISE from facing +Y (LemLib
+    // compass convention: 0 = facing +Y, positive = clockwise).
+    chassis.setPose(0, 0, 0);
 
-    chassis.turnToHeading(flipHeading(-30, isBlue), 200);
-    chassis.waitUntilDone();
 
     // NOTE: earlyExitRange only takes effect when minSpeed is non-zero
     // (see MoveToPointParams in chassis.hpp) -- add {.minSpeed = ...} too
     // if you want this movement to actually early-exit at 12in.
-    chassis.moveToPoint(flipX(-18.159, isBlue), flipY(-53.483, isBlue), 1000, {.earlyExitRange = 12});
-    // lift and score --> See the mechanism of how it works in the robot and program the scoring accordingly.
-    // fixed: `lift` doesn't exist, your two lift motor groups are lift_left/lift_right
-    lift_left.move(127);
-    lift_right.move(127);
-    claw.retract();
+    chassis.moveToPoint(0, 8, 600);
+
+    clamp.retract();
     chassis.waitUntilDone();
 
 
-    chassis.moveToPoint(flipX(-16.667, isBlue), flipY(-27.612, isBlue), 1400);
-    chassis.waitUntilDone();
+    chassis.moveToPoint(0, 14, 600);
+    chassis.moveToPoint(0, 1, 600, {.forwards = false});
+    chassis.turnToHeading(40, 700); 
 
-    chassis.moveToPoint(flipX(-19.154, isBlue), flipY(-26.120, isBlue), 800);
-    chassis.waitUntilDone();
-    // TODO(strategy): mechanism action here? path reverses out of this
-    // corner immediately after -- likely an intake/clamp spot.
 
-    chassis.moveToPoint(flipX(-1.493, isBlue), flipY(-44.528, isBlue), 1400, {.forwards = false});
+    chassis.moveToPoint(10, 12, 700, {.maxSpeed = 80});
     chassis.waitUntilDone();
+    chassis.turnToHeading(1, 800); 
+    chassis.moveToPoint(14, 28, 800, {.maxSpeed = 50});
+    pros::delay(700);
+    chassis.waitUntilDone();
+    clamp.extend();
+    pros::delay(200);
+    chassis.waitUntilDone();
+    chassis.turnToHeading(-4, 400);
+    lift_right.move(80);
+    lift_left.move(80);
+    pros::delay(350);
+    lift_right.move(0);
+    lift_left.move(0);
+    chassis.moveToPoint(11, 3, 800, {.forwards = false});
+    chassis.waitUntilDone();
+    chassis.turnToHeading(225, 600, {.maxSpeed = 76});
 
-    chassis.moveToPoint(flipX(-1.244, isBlue), flipY(-64.926, isBlue), 1200);
-    chassis.waitUntilDone();
+    // // // toggle
+    chassis.moveToPoint(1, -7, 600);
+    chassis.moveToPoint(11, 3, 800, {.forwards = false});
+    chassis.moveToPoint(1, -7, 600); // be in the same point area as the goal
+    chassis.moveToPoint(12, 4, 900, {.forwards = false});
 
-    chassis.moveToPoint(flipX(18.159, isBlue), flipY(-50.498, isBlue), 1400);
-    chassis.waitUntilDone();
+    chassis.turnToHeading(315, 600);
+    chassis.moveToPoint(29, -10, 800, {.forwards = false, .maxSpeed = 80});
+    rotation.move(80);
+    pros::delay(1200);
+    rotation.move(20);
+    pros::delay(620);
+    clamp.retract();
+    rotation.move(-90);
+    pros::delay(900);
+    chassis.moveToPoint(26, -7, 700);
 
-    chassis.moveToPoint(flipX(0.995, isBlue), flipY(-66.419, isBlue), 1300);
-    chassis.waitUntilDone();
+    chassis.swingToHeading(225, DriveSide::RIGHT, 1000);
+    chassis.moveToPoint(26, -8, 600);
+    chassis.swingToHeading(225, DriveSide::RIGHT, 800);
+    chassis.moveToPoint(26, -8, 600);
+    chassis.swingToHeading(225, DriveSide::RIGHT, 800);
+    chassis.moveToPoint(26, -8, 600);
+    chassis.swingToHeading(225, DriveSide::RIGHT, 800);
+    // chassis.moveToPoint(26, -10.7, 600, {.forwards = false});
 
-    chassis.moveToPoint(flipX(-41.294, isBlue), flipY(-50.001, isBlue), 2000);
-    chassis.waitUntilDone();
+    // chassis.moveToPoint(22.5, -14.9, 800, {.maxSpeed = 70});
+    // clamp.extend();
+    // chassis.waitUntilDone();
+    // chassis.moveToPoint(26, -10.7, 800, {.forwards = false});
+    // rotation.move(90);
+    // pros::delay(600);
+    // clamp.extend();
 
-    chassis.moveToPoint(flipX(-32.090, isBlue), flipY(-48.508, isBlue), 900);
-    chassis.waitUntilDone();
-
-    chassis.moveToPoint(flipX(-23.383, isBlue), flipY(-65.424, isBlue), 1200);
-    chassis.waitUntilDone();
-
-    chassis.moveToPoint(flipX(-23.135, isBlue), flipY(-53.981, isBlue), 900);
-    chassis.waitUntilDone();
-
-    chassis.moveToPoint(flipX(22.140, isBlue), flipY(-65.175, isBlue), 2100);
-    chassis.waitUntilDone();
-
-    chassis.moveToPoint(flipX(22.637, isBlue), flipY(-53.981, isBlue), 900);
-    chassis.waitUntilDone();
 }
 
 
-void left_side_auto(bool isBlue) {
-    // TODO(wiring): confirm this heading matches how the robot is
-    // physically placed on the tile.
-    chassis.setPose(flipX(-66.057, isBlue), flipY(7.823, isBlue), flipHeading(0, isBlue));
+void left_side_auto() {
+    chassis.setPose(0, 0, 0);
 
-    chassis.moveToPoint(flipX(-51.902, isBlue), flipY(-16.514, isBlue), 1400);
+    chassis.moveToPoint(0, 8, 600);
+
+    clamp.retract();
     chassis.waitUntilDone();
 
-    chassis.moveToPoint(flipX(-30.297, isBlue), flipY(-22.226, isBlue), 1300);
-    chassis.waitUntilDone();
+    chassis.moveToPoint(0, 14, 600);
+    chassis.moveToPoint(0, 1, 600, {.forwards = false});
+    chassis.turnToHeading(-40, 700); 
 
-    chassis.moveToPoint(flipX(-44.700, isBlue), flipY(-1.118, isBlue), 1400, {.forwards = false});
-    chassis.waitUntilDone();
 
-    chassis.moveToPoint(flipX(-64.319, isBlue), flipY(-0.869, isBlue), 1200);
-    chassis.waitUntilDone();
+    // chassis.moveToPoint(10, 12, 700, {.maxSpeed = 80});
+    // chassis.waitUntilDone();
+    // chassis.turnToHeading(1, 800); 
+    // chassis.moveToPoint(14, 28, 800, {.maxSpeed = 50});
+    // pros::delay(700);
+    // chassis.waitUntilDone();
+    // clamp.extend();
+    // pros::delay(200);
+    // chassis.waitUntilDone();
+    // chassis.turnToHeading(-4, 400);
+    // lift_right.move(80);
+    // lift_left.move(80);
+    // pros::delay(350);
+    // lift_right.move(0);
+    // lift_left.move(0);
+    // chassis.moveToPoint(11, 3, 800, {.forwards = false});
+    // chassis.waitUntilDone();
+    // chassis.turnToHeading(225, 600, {.maxSpeed = 76});
 
-    chassis.moveToPoint(flipX(-49.170, isBlue), flipY(19.246, isBlue), 1400);
-    chassis.waitUntilDone();
+    // // // // toggle
+    // chassis.moveToPoint(1, -7, 600);
+    // chassis.moveToPoint(11, 3, 800, {.forwards = false});
+    // chassis.moveToPoint(1, -7, 600); // be in the same point area as the goal
+    // chassis.moveToPoint(12, 4, 900, {.forwards = false});
 
-    chassis.moveToPoint(flipX(-62.580, isBlue), flipY(21.978, isBlue), 1000);
-    chassis.waitUntilDone();
+    // chassis.turnToHeading(315, 600);
+    // chassis.moveToPoint(28, -10.5, 800, {.forwards = false, .maxSpeed = 80});
+    // rotation.move(80);
+    // pros::delay(1600);
+    // clamp.retract();
+    // rotation.move(-90);
+    // pros::delay(900);
+    // chassis.cancelMotion();
+    // chassis.moveToPoint(26, -7, 700);
 
-    chassis.moveToPoint(flipX(-52.647, isBlue), flipY(22.971, isBlue), 900, {.forwards = false});
-    chassis.waitUntilDone();
+    // chassis.swingToHeading(300, DriveSide::RIGHT, 1300);
 
-    chassis.moveToPoint(flipX(-66.305, isBlue), flipY(-19.246, isBlue), 2000);
-    chassis.waitUntilDone();
-
-    chassis.moveToPoint(flipX(-53.143, isBlue), flipY(-22.226, isBlue), 1000);
-    chassis.waitUntilDone();
+    // chassis.moveToPoint(22.5, -14.9, 800, {.maxSpeed = 70});
+    // clamp.extend();
+    // chassis.waitUntilDone();
+    // chassis.moveToPoint(26, -10.7, 800, {.forwards = false});
+    // rotation.move(90);
+    // pros::delay(600);
+    // clamp.extend();
 }
 
 void skills(){
@@ -289,17 +312,21 @@ void skills(){
  * Runs in driver control
  */
 
-bool is_claw_flipped = false;
-bool clawOpen = false; 
+bool is_clamp_flipped = true;
+bool clampOpen = true;
 
-void opcontrol() {
+// how long the lift runs for after a single L1 tap, and at what speed --
+// tune LIFT_BUMP_MS until it lifts "a little bit" the way you want
+
+void opcontrol(){
+
     while (true) {
         int left_y = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
         int right_y = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_Y);
         chassis.tank(left_y, right_y);
 
         if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)) {
-            lift_right.move(127);  // Lift goes up
+            lift_right.move(127);  // Lift goes up, only for LIFT_BUMP_MS
             lift_left.move(127);
         } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {
             lift_right.move(-127); // Lift goes down
@@ -311,40 +338,28 @@ void opcontrol() {
             lift_left.move(0);
         }
 
-        if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {
-            intake.move(127);
-        } else if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)){
-            intake.move(-127);
-        }  else {
-            intake.move(0);
+        // the upper rotation if needed code 
+        if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)){
+            rotation.move(90);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)){
+            rotation.move(-90);
+        } else{
+            rotation.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+            rotation.move(0); 
         }
 
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
-            clawOpen = !clawOpen;
-            if (clawOpen) {
-                claw.extend();
+
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)) {
+            clampOpen = !clampOpen;
+            if (clampOpen) {
+                clamp.extend();
             } else {
-                claw.retract();
+                clamp.retract();
             }
-        }
+        };
 
-        // claw rotation toggle
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_RIGHT)) {
-            is_claw_flipped = !is_claw_flipped;
-            if (is_claw_flipped) {
-                claw_rotate.extend();
-            } else {
-                claw_rotate.retract();
-            }
-        }
-        pros::delay(20); 
-        // only uncomment once start tuning PID 
+        pros::delay(20);
 
-        // if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
-        //     angularTunerAuton(2.0);     // tune turning, kP = 2.0
-        // }
-        // if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)) {
-        //     linearTunerAuton(10.0);     // tune driving straight, kP = 10.0
-        // }
-    }
-}
+
+    };
+};
